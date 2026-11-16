@@ -1,0 +1,208 @@
+name: publish-artifacts
+
+# Builds the Underpin OS desktop install's portable PostgreSQL + pgvector
+# bundles and publishes them as releases of THIS repository.
+#
+# WHY THIS REPOSITORY EXISTS. The desktop install downloads these files on the
+# user's first run, so they have to be reachable WITHOUT authentication. The
+# product's own repository is private, so the artifacts live here, in a
+# public repository, and the installer's manifest points at these releases.
+#
+# WHAT IS BUILT. Upstream PostgreSQL publishes no portable binaries for Linux
+# or macOS (the distribution packages need root; EDB publishes the "binaries
+# without installer" archive for Windows only), and upstream pgvector
+# publishes no binaries at all. So the platforms that have no publisher build
+# their own:
+#
+#   - linux/*, darwin/* — PostgreSQL built FROM SOURCE (a pinned upstream
+#     tarball, verified by sha256) with pgvector built against THAT server.
+#     One artifact per platform: the extension and the server it loads into
+#     are one thing, so the extension ABI question cannot be asked.
+#
+#   - windows/amd64 — the official EDB PostgreSQL binaries (a real build, and
+#     they carry the CLIENT TOOLS pg_dump/pg_restore that the desktop backup
+#     needs) plus a pgvector extension built HERE, from a pinned upstream tag,
+#     because upstream publishes no Windows binaries. Building it ourselves
+#     removes a third-party community binary from the install's trust
+#     boundary.
+#
+# EVERY artifact is VERIFIED before it is packaged: the built server is
+# started for real, the extension is loaded, a vector is computed through it,
+# and a pg_dump/pg_restore round trip completes. A build that compiles but
+# does not load is worse than no build -- the install would provision a cluster
+# whose vector extension silently refuses to activate, and the first embedding
+# insert would fail with a message that points at the embedding code rather
+# than at the extension.
+#
+# WHICH PART CANNOT BE VERIFIED HERE. The Windows extension build needs the
+# MSVC toolchain and PostgreSQL's Windows headers, which the windows runner
+# has and a Linux container does not. The recipe is the one pgvector documents
+# for Windows (nmake /F Makefile.win), and the job verifies the build the same
+# way the linux job does -- by loading the extension and computing a vector.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'The upstream pgvector tag to build (e.g. v0.8.6)'
+        required: true
+        default: 'v0.8.6'
+  push:
+    tags:
+      - 'pgbundle-v*'
+
+permissions:
+  contents: read
+
+env:
+  PG_VERSION: '17.6'
+  # The sha256 published by postgresql.org for the source tarball. The build
+  # refuses to proceed if the downloaded bytes do not hash to this.
+  PG_SHA256: 'e0630a3600aea27511715563259ec2111cd5f4353a4b040e0be827f94cd7a8b0'
+
+jobs:
+  bundle:
+    name: bundle (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            os: ubuntu-latest
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+          - platform: darwin-arm64
+            os: macos-14
+            # The arm64 macOS runner image is not available to every account
+            # (it resolved to an 'xl' image this account cannot use), so this
+            # platform is allowed to fail WITHOUT reddening the workflow: the
+            # publish job ships whatever platforms did build, and the darwin
+            # bundle appears as soon as its runner image is reachable.
+            continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install the build toolchain (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential bison flex ca-certificates git curl bzip2 patchelf
+
+      - name: Install the build toolchain (macos)
+        if: runner.os == 'macOS'
+        run: |
+          # bison and flex are the parser generators PostgreSQL's build
+          # needs; install_name_tool (used to make the tree relocatable)
+          # ships with the command line tools, which the runner image has.
+          brew install bison flex
+
+      - name: Build + verify + package the portable bundle
+        run: bash scripts/build-postgres-pgvector/build-bundle.sh
+        env:
+          PGVECTOR_VERSION: ${{ inputs.version || 'v0.8.6' }}
+          OUT_DIR: out
+          PREFIX: ${{ github.workspace }}/.bundle/pgsql
+          SRC_DIR: ${{ github.workspace }}/.bundle/src
+
+      - name: Upload the packaged bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: postgres-pgvector-${{ matrix.platform }}
+          path: out
+          if-no-files-found: error
+
+  extension:
+    name: extension (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-amd64
+            os: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL 17 + the MSVC toolchain (windows)
+        shell: pwsh
+        run: |
+          # pgvector's Windows build needs flex/bison (the parser generators)
+          # and the Visual Studio build tools, which the runner image carries.
+          choco install -y --no-progress flex bison
+          # PostgreSQL 17 for Windows: the official installer, which brings
+          # pg_config and the headers the extension compiles against.
+          Invoke-WebRequest -Uri "https://get.enterprisedb.com/postgresql/postgresql-17.6-1-windows-x64-binaries.zip" -OutFile "$env:RUNNER_TEMP\pg.zip"
+          Expand-Archive "$env:RUNNER_TEMP\pg.zip" "$env:RUNNER_TEMP\pg"
+          $pgRoot = "$env:RUNNER_TEMP\pg\pgsql"
+          "$pgRoot\bin" >> $env:GITHUB_PATH
+          "PG_ROOT=$pgRoot" >> $env:GITHUB_ENV
+          # The extension's Makefile.win expects a PostgreSQL installation with
+          # the server headers; the binaries archive carries lib/ and share/ but
+          # not include/, so the headers come from the installer instead.
+          choco install -y --no-progress postgresql17 --params "/Password:postgres /Port:5432"
+          $install = "C:\Program Files\PostgreSQL\17"
+          Copy-Item -Recurse -Force "$install\include" "$pgRoot\include"
+          Copy-Item -Recurse -Force "$install\lib" "$pgRoot\libpg"
+          Copy-Item -Force "$install\lib\*.lib" "$pgRoot\libpg" -ErrorAction SilentlyContinue
+          "PG_CONFIG=$pgRoot\bin\pg_config.exe" >> $env:GITHUB_ENV
+
+      - name: Build + verify + package the extension (windows)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/build-pgvector/build-pgvector-windows.ps1
+        env:
+          PGVECTOR_VERSION: ${{ inputs.version || 'v0.8.6' }}
+
+      - name: Upload the packaged extension
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgvector-${{ matrix.platform }}
+          path: out
+          if-no-files-found: error
+
+  publish:
+    name: publish the bundle
+    needs: [bundle, extension]
+    if: startsWith(github.ref, 'refs/tags/pgbundle-v')
+    runs-on: ubuntu-latest
+    permissions:
+      # The release is created in THIS repository, so the workflow's own
+      # token is enough -- no separate credential is needed anywhere.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Collect the per-platform trees
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: false
+
+      - name: Checksums
+        run: |
+          cd dist
+          # Each platform's tree becomes ONE zip, so the install can pin a
+          # SINGLE digest per platform (the manifest pins one artifact, not a
+          # directory of files).
+          for d in */; do
+            name="$(basename "$d")"
+            (cd "$d" && zip -q -r "../${name}.zip" .)
+            rm -rf "$d"
+          done
+          # The checksum file is written through a TEMP name and moved into
+          # place: writing it directly would be a read and a write of the same
+          # file in one pipeline (shellcheck SC2094), and the find could
+          # otherwise see the half-written manifest.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS.tmp
+          mv SHA256SUMS.tmp SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
