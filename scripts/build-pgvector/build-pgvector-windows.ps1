@@ -171,7 +171,14 @@ try {
     Invoke-Native $psql ($db + @('-c', 'CREATE TABLE v (id serial primary key, e vector(3))'))
     Invoke-Native $psql ($db + @('-c', "INSERT INTO v (e) VALUES ('[1,0,0]')")) | Out-Null
     $dist = (Invoke-Native $psql ($db + @('-t', '-A', '-c', "SELECT round((e <=> '[1,0,0]')::numeric, 6) FROM v LIMIT 1"))).Trim()
-    if ($dist -ne '0') { throw "the vector distance came back as '$dist', want 0" }
+    # The comparison is NUMERIC, not textual: the value arrives as
+    # "0.000000", and a string comparison against "0" fails a check whose
+    # subject is in fact correct. (The Linux script learned this the same
+    # way; this one learned it from the first Windows run of this workflow.)
+    $distance = 0.0
+    if (-not [double]::TryParse($dist, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$distance) -or $distance -ne 0) {
+        throw "the vector distance came back as '$dist', want 0"
+    }
     Write-Step 'the built extension computes a vector'
 }
 finally {
