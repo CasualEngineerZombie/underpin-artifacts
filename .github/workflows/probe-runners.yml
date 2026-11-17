@@ -1,0 +1,23 @@
+name: probe-runners
+
+# TEMPORARY: answers which macOS runner labels this repository's account can
+# actually start. Delete once the darwin rows in publish-artifacts.yml are
+# settled.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-13
+          - macos-14
+          - macos-15
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Say what this runner is
+        run: echo "uname=$(uname -m) image=${{ matrix.os }}"
