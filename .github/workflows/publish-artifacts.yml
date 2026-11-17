@@ -212,6 +212,16 @@ jobs:
           # directory of files).
           for d in */; do
             name="$(basename "$d")"
+            # THE ARTIFACT STORE DOES NOT PRESERVE FILE MODES. bin/* comes
+            # back 0644, and a ZIP that says a PostgreSQL tree needs no
+            # executable is a ZIP that unpacks into a tree which cannot start
+            # ("permission denied" on the first initdb). Measured on the real
+            # published asset, so the bits are restored here -- the archive is
+            # also what a person unzips by hand from the release page.
+            chmod -R a+rX "$d"
+            if [ -d "$d/bin" ]; then
+              chmod 0755 "$d"/bin/*
+            fi
             (cd "$d" && zip -q -r "../${name}.zip" .)
             rm -rf "$d"
           done
