@@ -50,9 +50,22 @@ set -euo pipefail
 PG_VERSION="${PG_VERSION:-17.6}"
 PG_SHA256="${PG_SHA256:-e0630a3600aea27511715563259ec2111cd5f4353a4b040e0be827f94cd7a8b0}"
 PGVECTOR_VERSION="${PGVECTOR_VERSION:-v0.8.6}"
-PREFIX="${PREFIX:-$PWD/build/pgsql}"
+
+# ANCHOR EVERY PATH BEFORE THE BUILD CHANGES DIRECTORY. The build cd's into the
+# PostgreSQL source tree (step 2) and never comes back, so a RELATIVE path is
+# resolved against that tree rather than against the directory the caller ran
+# the script in. That bug shipped once: CI passed OUT_DIR=out, the bundle was
+# written into src/postgresql-17.6/out, and the upload step -- which looked for
+# out/ at the workspace root -- found nothing, so the build "succeeded" and
+# produced no artifact. Resolving to absolute here makes the values mean the
+# caller's directory no matter how many times the script cd's.
+INVOCATION_DIR="$PWD"
+PREFIX="${PREFIX:-$INVOCATION_DIR/build/pgsql}"
 OUT_DIR="${OUT_DIR:-out}"
-SRC_DIR="${SRC_DIR:-$PWD/src}"
+SRC_DIR="${SRC_DIR:-$INVOCATION_DIR/src}"
+case "$PREFIX" in /*) ;; *) PREFIX="$INVOCATION_DIR/$PREFIX" ;; esac
+case "$OUT_DIR" in /*) ;; *) OUT_DIR="$INVOCATION_DIR/$OUT_DIR" ;; esac
+case "$SRC_DIR" in /*) ;; *) SRC_DIR="$INVOCATION_DIR/$SRC_DIR" ;; esac
 
 # nproc is Linux; macOS has sysctl. The fallback keeps a single-core machine
 # working rather than failing the build.
@@ -324,5 +337,15 @@ else
 fi
 
 say "packaged the bundle into $OUT_DIR"
+
+# A tree that exists but is missing the binaries the install runs is not a
+# bundle. This is the LAST cheap check before packaging is declared done: a
+# relative OUT_DIR once landed in the source tree and the upload found nothing,
+# so the tree's completeness is asserted here as well as by the upload step.
+for required in bin/postgres bin/initdb bin/pg_ctl bin/psql bin/pg_dump bin/pg_restore; do
+	[ -x "$OUT_DIR/$required" ] || abort "the packaged tree is missing $required"
+done
+[ -f "$OUT_DIR/lib/vector.${VEC_EXT}" ] || abort "the packaged tree is missing the pgvector extension"
+
 du -sh "$OUT_DIR"
 find "$OUT_DIR" -type f | wc -l | sed 's/^/files: /'

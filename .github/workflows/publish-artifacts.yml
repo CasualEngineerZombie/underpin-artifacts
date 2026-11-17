@@ -64,6 +64,17 @@ jobs:
   bundle:
     name: bundle (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
+    # A platform that is not yet SHIPPED must not block the release the shipped
+    # ones are in: the manifest pins one digest per platform, so a missing
+    # darwin asset means "no macOS row yet", not "a broken release". The job is
+    # still red in the run — that is the signal — and the publish job's summary
+    # lists every platform it did and did not carry.
+    #
+    # NOTE the indirection through `matrix.experimental`: writing
+    # `continue-on-error` directly inside a matrix `include` entry only creates
+    # a matrix FIELD of that name; the job-level property is not read from the
+    # matrix, so it silently did nothing.
+    continue-on-error: ${{ matrix.experimental == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -73,13 +84,16 @@ jobs:
           - platform: linux-arm64
             os: ubuntu-24.04-arm
           - platform: darwin-arm64
-            os: macos-14
-            # The arm64 macOS runner image is not available to every account
-            # (it resolved to an 'xl' image this account cannot use), so this
-            # platform is allowed to fail WITHOUT reddening the workflow: the
-            # publish job ships whatever platforms did build, and the darwin
-            # bundle appears as soon as its runner image is reachable.
-            continue-on-error: true
+            # macos-14 is pinned to an arm64 image configuration this account
+            # cannot start ("The configuration 'macos-14-arm64-us-default' is
+            # not supported"), while macos-15 is the arm64 image it can.
+            os: macos-15
+            experimental: true
+          - platform: darwin-x64
+            # macos-13 -- the other Intel image -- is retired, so a job asking
+            # for it queues forever. macos-15-intel is the x64 image.
+            os: macos-15-intel
+            experimental: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -103,7 +117,9 @@ jobs:
         run: bash scripts/build-postgres-pgvector/build-bundle.sh
         env:
           PGVECTOR_VERSION: ${{ inputs.version || 'v0.8.6' }}
-          OUT_DIR: out
+          # ABSOLUTE, so the upload below and the script's `cd` into the
+          # PostgreSQL source tree cannot disagree about where `out` is.
+          OUT_DIR: ${{ github.workspace }}/out
           PREFIX: ${{ github.workspace }}/.bundle/pgsql
           SRC_DIR: ${{ github.workspace }}/.bundle/src
 
@@ -111,7 +127,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: postgres-pgvector-${{ matrix.platform }}
-          path: out
+          path: ${{ github.workspace }}/out
           if-no-files-found: error
 
   extension:
@@ -127,28 +143,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install PostgreSQL 17 + the MSVC toolchain (windows)
+      - name: Fetch the PostgreSQL 17.6 tree the install ships (windows)
         shell: pwsh
         run: |
-          # pgvector's Windows build needs flex/bison (the parser generators)
-          # and the Visual Studio build tools, which the runner image carries.
-          choco install -y --no-progress flex bison
-          # PostgreSQL 17 for Windows: the official installer, which brings
-          # pg_config and the headers the extension compiles against.
-          Invoke-WebRequest -Uri "https://get.enterprisedb.com/postgresql/postgresql-17.6-1-windows-x64-binaries.zip" -OutFile "$env:RUNNER_TEMP\pg.zip"
-          Expand-Archive "$env:RUNNER_TEMP\pg.zip" "$env:RUNNER_TEMP\pg"
+          # The EDB "binaries without installer" archive is THE tree the
+          # desktop install provisions. It carries the server, the client
+          # tools AND the headers an extension compiles against (include/,
+          # include/server/), so the extension is built against the exact
+          # bytes users run -- no second PostgreSQL installation is needed,
+          # and none is used.
+          $url = 'https://get.enterprisedb.com/postgresql/postgresql-17.6-1-windows-x64-binaries.zip'
+          # The SAME digest the installer's manifest pins. If EDB replaces
+          # the archive behind this URL, the build must stop rather than
+          # produce an extension for a server nobody ships.
+          $wantSha = 'd378882abd001a186735acd6f6ba716bca6ccd192e800412d4fd15ed25376b3e'
+          $zip = "$env:RUNNER_TEMP\pg.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $gotSha = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($gotSha -ne $wantSha) { throw "the EDB archive hashes to $gotSha, want $wantSha" }
+          Expand-Archive $zip "$env:RUNNER_TEMP\pg"
           $pgRoot = "$env:RUNNER_TEMP\pg\pgsql"
+          if (-not (Test-Path "$pgRoot\include\server\postgres.h")) {
+            throw "the EDB archive carries no server headers at $pgRoot\include\server, so the extension cannot be built against it"
+          }
           "$pgRoot\bin" >> $env:GITHUB_PATH
           "PG_ROOT=$pgRoot" >> $env:GITHUB_ENV
-          # The extension's Makefile.win expects a PostgreSQL installation with
-          # the server headers; the binaries archive carries lib/ and share/ but
-          # not include/, so the headers come from the installer instead.
-          choco install -y --no-progress postgresql17 --params "/Password:postgres /Port:5432"
-          $install = "C:\Program Files\PostgreSQL\17"
-          Copy-Item -Recurse -Force "$install\include" "$pgRoot\include"
-          Copy-Item -Recurse -Force "$install\lib" "$pgRoot\libpg"
-          Copy-Item -Force "$install\lib\*.lib" "$pgRoot\libpg" -ErrorAction SilentlyContinue
-          "PG_CONFIG=$pgRoot\bin\pg_config.exe" >> $env:GITHUB_ENV
 
       - name: Build + verify + package the extension (windows)
         shell: pwsh
@@ -166,7 +185,10 @@ jobs:
   publish:
     name: publish the bundle
     needs: [bundle, extension]
-    if: startsWith(github.ref, 'refs/tags/pgbundle-v')
+    # !cancelled() rather than plain `success()`: an EXPERIMENTAL platform that
+    # failed (see the bundle job) must not suppress the release the shipped
+    # platforms are in. A cancellation still stops everything.
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/pgbundle-v') }}
     runs-on: ubuntu-latest
     permissions:
       # The release is created in THIS repository, so the workflow's own
@@ -200,6 +222,46 @@ jobs:
           find . -maxdepth 1 -type f ! -name SHA256SUMS | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS.tmp
           mv SHA256SUMS.tmp SHA256SUMS
           cat SHA256SUMS
+
+      - name: Say which platforms this release carries
+        run: |
+          set -euo pipefail
+          cd dist
+          # A release that silently omits a platform is a release somebody
+          # finds out about from a user. Every platform is named here, so the
+          # run's summary answers "what is in this tag" without opening it.
+          #
+          # The SHIPPED platforms are REQUIRED; the others are reported as
+          # missing without failing the release -- the manifest pins one
+          # digest per platform, and a platform with no row yet is not part of
+          # the contract.
+          required="postgres-pgvector-linux-amd64.zip"
+          expected="
+            postgres-pgvector-linux-amd64.zip
+            postgres-pgvector-linux-arm64.zip
+            postgres-pgvector-darwin-arm64.zip
+            postgres-pgvector-darwin-x64.zip
+            pgvector-windows-amd64.zip
+          "
+          {
+            echo "### desktop artifacts in \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "| asset | size | sha256 |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for asset in $expected; do
+            if [ -f "$asset" ]; then
+              size="$(stat -c %s "$asset")"
+              sha="$(sha256sum "$asset" | cut -d' ' -f1)"
+              echo "| \`$asset\` | $size | \`$sha\` |" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "| \`$asset\` | **not built** | — |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::warning::$asset is not in this release"
+            fi
+          done
+          for asset in $required; do
+            [ -f "$asset" ] || { echo "::error::$asset is a SHIPPED platform's bundle and is missing"; exit 1; }
+          done
 
       - name: Publish the release
         uses: softprops/action-gh-release@v2
