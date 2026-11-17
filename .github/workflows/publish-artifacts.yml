@@ -218,9 +218,15 @@ jobs:
           # The checksum file is written through a TEMP name and moved into
           # place: writing it directly would be a read and a write of the same
           # file in one pipeline (shellcheck SC2094), and the find could
-          # otherwise see the half-written manifest.
-          find . -maxdepth 1 -type f ! -name SHA256SUMS | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS.tmp
+          # otherwise see the half-written manifest. The temp name itself is
+          # EXCLUDED from the find -- the first cut listed it, so every
+          # published SHA256SUMS carried a digest for a file that is not in
+          # the release.
+          find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' | LC_ALL=C sort | xargs -r sha256sum > SHA256SUMS.tmp
           mv SHA256SUMS.tmp SHA256SUMS
+          # The sums file is only useful if it VERIFIES. This is the check the
+          # file above got wrong, so it is asserted rather than assumed.
+          sha256sum --check --quiet SHA256SUMS
           cat SHA256SUMS
 
       - name: Say which platforms this release carries

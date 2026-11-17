@@ -99,9 +99,12 @@ SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SO
 # ---------------------------------------------------------------------------------------
 run_verification() {
 	set -euo pipefail
-	PG_CONFIG="${PG_CONFIG:-$PREFIX/bin/pg_config}"
-	[ -x "$PG_CONFIG" ] || abort "pg_config is missing from $PREFIX/bin"
-	PGBIN="$("$PG_CONFIG" --bindir)"
+	# The tree, NOT pg_config: pg_config reports the prefix the tree was BUILT
+	# with, and this function verifies the tree it is pointed at -- including
+	# the PACKAGED tree after it has been moved, where pg_config's answer
+	# would name a directory that is not the one being verified.
+	PGBIN="$PREFIX/bin"
+	[ -x "$PGBIN/initdb" ] || abort "initdb is missing from $PGBIN"
 	PGDATA="${VERIFY_DIR:?}/data"
 	SOCKDIR="${VERIFY_DIR:?}/sock"
 	VERIFY_PORT="${VERIFY_PORT:-55434}"
@@ -273,11 +276,11 @@ if [ "$(id -u)" = "0" ]; then
 	chmod a+x "$PREFIX/bin"
 	VERIFY_DIR="$(mktemp -d)"
 	chmod 0777 "$VERIFY_DIR"
-	su "$VERIFY_USER" -s /bin/bash -c "VERIFY_DIR='$VERIFY_DIR' PREFIX='$PREFIX' PG_CONFIG='$PG_CONFIG' bash '$SCRIPT_PATH' --verify-only" \
+	su "$VERIFY_USER" -s /bin/bash -c "VERIFY_DIR='$VERIFY_DIR' PREFIX='$PREFIX' bash '$SCRIPT_PATH' --verify-only" \
 		|| abort "the verification failed — the built server does not run, or the extension does not load"
 else
 	VERIFY_DIR="$(mktemp -d)"
-	VERIFY_DIR="$VERIFY_DIR" PG_CONFIG="$PG_CONFIG" bash "$SCRIPT_PATH" --verify-only \
+	VERIFY_DIR="$VERIFY_DIR" PREFIX="$PREFIX" bash "$SCRIPT_PATH" --verify-only \
 		|| abort "the verification failed — the built server does not run, or the extension does not load"
 fi
 
@@ -311,29 +314,39 @@ find "$OUT_DIR" -name '*.a' -delete 2>/dev/null || true
 say "rewriting the runtime search path so the tree is relocatable"
 if [ "$(uname -s)" = "Darwin" ]; then
 	command -v install_name_tool >/dev/null 2>&1 || abort "install_name_tool is missing (macOS ships it in the command line tools)"
+	# EVERY dependency that points into the build prefix -- not just libpq --
+	# is rewritten: a bundle that links any one library by its build-time path
+	# starts only on the machine that built it. The list comes from otool, so
+	# only dependencies that are actually there are touched, and a rewrite
+	# that FAILS is fatal rather than swallowed.
 	for f in "$OUT_DIR"/bin/* "$OUT_DIR"/lib/*.dylib; do
 		[ -f "$f" ] || continue
-		# The install names that point INTO the build prefix become
-		# @loader_path/../lib, which is the tree's own lib/ directory
-		# whatever directory the tree ends up in.
-		install_name_tool -change "$PREFIX/lib/libpq.5.dylib" "@loader_path/../lib/libpq.5.dylib" "$f" 2>/dev/null || true
-		install_name_tool -id "@loader_path/../lib/$(basename "$f")" "$f" 2>/dev/null || true
+		while IFS= read -r dep; do
+			case "$dep" in
+			"$PREFIX"/lib/*)
+				install_name_tool -change "$dep" "@loader_path/../lib/$(basename "$dep")" "$f" \
+					|| abort "could not rewrite the dependency $dep in $f"
+				;;
+			esac
+		done < <(otool -L "$f" | awk 'NR > 1 { print $1 }')
 	done
+	# A dylib's own INSTALL NAME is what other binaries link against, so that
+	# becomes relative too. Only dylibs carry one.
+	for f in "$OUT_DIR"/lib/*.dylib; do
+		[ -f "$f" ] || continue
+		install_name_tool -id "@loader_path/../lib/$(basename "$f")" "$f" \
+			|| abort "could not rewrite the install name of $f"
+	done
+	say "the install names are now relative to the tree"
 else
-	if command -v patchelf >/dev/null 2>&1; then
-		for f in "$OUT_DIR"/bin/* "$OUT_DIR"/lib/*.so; do
-			[ -f "$f" ] || continue
-			# $ORIGIN is the directory of the binary itself, so ../lib is
-			# the tree's lib/ directory relative to it.
-			patchelf --set-rpath '$ORIGIN/../lib' "$f" 2>/dev/null || true
-		done
-		say "the runtime search path is now relative to the tree"
-	else
-		# patchelf is missing: the tree still WORKS as long as it is left
-		# where it was built, but it would not be relocatable. This is
-		# reported rather than silently shipped.
-		say "WARNING: patchelf is not installed, so the tree keeps the build-time library path"
-	fi
+	command -v patchelf >/dev/null 2>&1 || abort "patchelf is missing, so the tree cannot be made relocatable — a bundle that only runs where it was built is not a bundle"
+	for f in "$OUT_DIR"/bin/* "$OUT_DIR"/lib/*.so; do
+		[ -f "$f" ] || continue
+		# $ORIGIN is the directory of the binary itself, so ../lib is the
+		# tree's lib/ directory relative to it.
+		patchelf --set-rpath '$ORIGIN/../lib' "$f" 2>/dev/null || true
+	done
+	say "the runtime search path is now relative to the tree"
 fi
 
 say "packaged the bundle into $OUT_DIR"
@@ -346,6 +359,30 @@ for required in bin/postgres bin/initdb bin/pg_ctl bin/psql bin/pg_dump bin/pg_r
 	[ -x "$OUT_DIR/$required" ] || abort "the packaged tree is missing $required"
 done
 [ -f "$OUT_DIR/lib/vector.${VEC_EXT}" ] || abort "the packaged tree is missing the pgvector extension"
+
+# --- 7. verify the tree AS PACKAGED, at a path it was not built in ----------
+# Steps 4-6 verified the tree where it was BUILT. What the install runs is
+# this COPY, moved to a directory the user chose, after the search paths were
+# rewritten -- and a stale build-time path is exactly the kind of thing that
+# works on the machine that built it and fails on every other one. So the
+# whole verification runs again, against a copy in a fresh temporary
+# directory, and the bundle is shipped only if it passes.
+say "verifying the packaged tree after moving it"
+RELOC_DIR="$(mktemp -d)"
+cp -a "$OUT_DIR" "$RELOC_DIR/pg"
+chmod -R a+rX "$RELOC_DIR"
+# The verification runs as an unprivileged user, which has to be able to
+# create its data directory inside this one.
+chmod 0777 "$RELOC_DIR"
+if [ "$(id -u)" = "0" ]; then
+	su "$VERIFY_USER" -s /bin/bash -c "VERIFY_DIR='$RELOC_DIR' PREFIX='$RELOC_DIR/pg' bash '$SCRIPT_PATH' --verify-only" \
+		|| abort "the PACKAGED tree does not run after being moved — a shipped binary still points at the build directory"
+else
+	VERIFY_DIR="$RELOC_DIR" PREFIX="$RELOC_DIR/pg" bash "$SCRIPT_PATH" --verify-only \
+		|| abort "the PACKAGED tree does not run after being moved — a shipped binary still points at the build directory"
+fi
+rm -rf "$RELOC_DIR"
+say "the packaged tree runs where it is unpacked"
 
 du -sh "$OUT_DIR"
 find "$OUT_DIR" -type f | wc -l | sed 's/^/files: /'
